@@ -14,7 +14,7 @@ on:
 jobs:
   performance:
     runs-on: ci-standard
-    uses: http://lenovo.local:3000/justdoGIT/ci-templates/.forgejo/workflows/reusable-performance.yml@b7079eb3579ae146ae67b4faa3d29e1700011daa
+    uses: http://192.168.1.4:3000/justdoGIT/ci-templates/.forgejo/workflows/reusable-performance.yml@b7079eb3579ae146ae67b4faa3d29e1700011daa
     with:
       runner_label: ci-standard
       templates_ref: b7079eb3579ae146ae67b4faa3d29e1700011daa
