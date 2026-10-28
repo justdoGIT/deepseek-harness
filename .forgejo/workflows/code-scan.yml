@@ -9,4 +9,5 @@ on:
 
 jobs:
   semgrep:
+    runs-on: ci-standard
     uses: http://lenovo.local:3000/justdoGIT/ci-templates/.forgejo/workflows/reusable-code-scan.yml@b7079eb3579ae146ae67b4faa3d29e1700011daa
