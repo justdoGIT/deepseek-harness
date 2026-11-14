@@ -1,71 +1,73 @@
-// Web toolview registrant: the keyed toolview hole for the `web_search` and
-// `web_fetch` tools. Registered under BOTH, since both declare the one `web`
-// render intent and render through the one WebBlock family; the row
-// discriminates on the toolName only to pick its icon and title. The row
-// composes the shared ToolRow (chrome, running sweep, whole-row expand) and
-// feeds it the completed retrieval as ToolRow's `web` card material, so it
-// renders through WebBlock in the collapsed-by-default expanded body — the same
-// unified interaction every other card row has. Until the call settles there is
-// no web card (the tools keep a generic pending view), so a running row is the
-// summary line alone.
-
 import type { Context } from '@deepseek-ai/cordis'
-import { IconBrowseOutline16, IconGlobeOutline14 } from '@deepseek-ai/dsh-client-ui-primitives'
+import { IconBrowseOutlineRegular, IconGlobeOutlineRegular } from '@deepseek-ai/dsh-client-ui-primitives'
 import type { PropsLocale } from '@deepseek-ai/dsh-client-ui-slots'
 import type { ToolCallViewProps } from '../../contract/slots.ts'
-import { webCardModel } from '../models/web-card-model.ts'
+import { webCardModel, webFetchHref } from '../models/web-card-model.ts'
 import { toolRowModel } from '../models/tool-call-model.ts'
 import { ToolRow } from '../components/ToolRow.tsx'
 import { CONVERSATION_NS as NS } from '../../locale.ts'
 
-/** Full row props: the toolview runtime share plus the standard locale seat. */
 type WebRowProps = ToolCallViewProps & PropsLocale<'conversation'>
 
-/** web_fetch reads one URL; web_search queries. Titles are figma literals. */
-const WEB_TITLES: Record<string, string> = {
-  web_search: 'Search',
-  web_fetch: 'Fetch',
+const WEB_TITLE_KEYS = {
+  web_search: 'tool.title.webSearch',
+  web_fetch: 'tool.title.webFetch',
+} as const
+
+/** Collapsed-row summaries for the transport failure codes of `dsh-web-fetch-http` (`src/transport-failure.ts`). */
+const WEB_FETCH_FAILURE_KEYS = {
+  WEB_FETCH_DNS_FAILED: 'tool.webFetch.failure.dns',
+  WEB_FETCH_CONNECTION_REFUSED: 'tool.webFetch.failure.refused',
+  WEB_FETCH_CONNECTION_TIMEOUT: 'tool.webFetch.failure.connectionTimeout',
+  WEB_FETCH_CERTIFICATE_INVALID: 'tool.webFetch.failure.certificate',
+  WEB_FETCH_CONNECTION_INTERRUPTED: 'tool.webFetch.failure.interrupted',
+  WEB_FETCH_NETWORK_UNREACHABLE: 'tool.webFetch.failure.unreachable',
+  WEB_FETCH_NETWORK_ERROR: 'tool.webFetch.failure.network',
+} as const
+
+/** Whether a recorded error code is a web_fetch transport failure code. */
+function isFetchFailureCode(code: string): code is keyof typeof WEB_FETCH_FAILURE_KEYS {
+  return Object.hasOwn(WEB_FETCH_FAILURE_KEYS, code)
 }
 
-/**
- * Web row: icon + Search/Fetch · {summary} in the shared ToolRow chrome, with
- * the completed retrieval's web card as the row's collapsed-by-default card
- * body. The row discriminates on `toolName` only to pick its icon and title.
- */
-export function WebRow({ toolName, block, inspect, t }: WebRowProps) {
+/** Lets users expand a completed web search or fetch result. */
+export function WebRow({ toolName, block, useContextMenu, sessionId, inspect, useDisclosure, t }: WebRowProps) {
+  const { getTriggerProps } = useContextMenu()
+  const href = webFetchHref(block)
   const model = toolRowModel(toolName, block)
   const web = webCardModel(block)
-  // Web search uses a globe; local grep/glob keep the magnifier family.
-  const icon = toolName === 'web_fetch' ? <IconBrowseOutline16 size={14} /> : <IconGlobeOutline14 size={14} />
+  // A classified transport failure leads with its localized summary; the expanded output keeps the code and detail.
+  const code = 'kind' in block ? block.error?.code : undefined
+  const failureKey = model.state === 'error' && toolName === 'web_fetch' && code !== undefined && isFetchFailureCode(code)
+    ? WEB_FETCH_FAILURE_KEYS[code]
+    : undefined
+  const icon = toolName === 'web_fetch' ? <IconBrowseOutlineRegular size={14} /> : <IconGlobeOutlineRegular size={14} />
   return (
     <ToolRow
+      urlContextMenuProps={getTriggerProps(href === undefined ? undefined : { kind: 'url', value: { sessionId, url: href } })}
+      useDisclosure={useDisclosure}
       t={t}
       variant={model.variant}
       toolName={toolName}
       icon={icon}
-      title={WEB_TITLES[toolName] ?? model.title}
+      title={t(toolName === 'web_search'
+        ? WEB_TITLE_KEYS.web_search
+        : toolName === 'web_fetch' ? WEB_TITLE_KEYS.web_fetch : model.titleKey)}
       summary={model.summary}
-      body={null}
       output={model.output}
-      errorSummary={model.errorSummary}
+      errorSummary={failureKey === undefined ? model.errorSummary : t(failureKey)}
       web={web}
+      href={href}
       state={model.state}
       inspect={inspect}
     />
   )
 }
 
-/**
- * The web rows follow the atomic Tool-view declaration across activation and
- * reload. One WebRow component registers under both web tool names.
- */
+/** Registers the web search and fetch conversation rows. */
 export const webToolview = {
   name: 'web-toolview',
   inject: ['slots'],
-  /**
-   * Register the web row under both web tool names' keyed toolview holes.
-   * @param ctx - registrant context (disposal rides ctx.effect inside slots.register).
-   */
   apply(ctx: Context): void {
     ctx.slots.inject('tool.call.toolview', function* () {
       yield ctx.slots.register({ name: 'tool.call.toolview', key: 'web_search', locale: NS }, WebRow)

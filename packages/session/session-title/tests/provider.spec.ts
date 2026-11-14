@@ -1,12 +1,17 @@
+import AgentRegistry from '@deepseek-ai/dsh-agent'
 import { Context } from '@deepseek-ai/cordis'
-import { describe, expect, it, vi } from 'vitest'
-import LlmRuntime, { createUserMessage, deepFreeze, markAgentLoopRequest  } from '@deepseek-ai/dsh-llm'
-import SessionStore, { SessionId } from '@deepseek-ai/dsh-session'
+import { describe, expect, it, onTestFinished, vi } from 'vitest'
+import LlmRuntime, { createUserMessage, markAgentLoopRequest } from '@deepseek-ai/dsh-llm'
+import { deepFreeze } from '@deepseek-ai/dsh-util-values'
+import SessionStore, { type SessionId, SessionSeq } from '@deepseek-ai/dsh-session'
+import SessionProjectionRegistry from '@deepseek-ai/dsh-session-projection'
+import { brandString } from '@deepseek-ai/dsh-brand'
+import type { SessionTitleProviderId } from '@deepseek-ai/dsh-session-title/types'
 import SessionTitleService, {
-  SessionTitleProviderId,
   type SessionTitleProvider,
   type SessionTitleProviderRequest,
   type SessionTitleProviderResult,
+  type SessionTitleSnapshot,
 } from '@deepseek-ai/dsh-session-title'
 
 const CONFIG = {
@@ -48,11 +53,33 @@ function appendRoute(session: ReturnType<Context['sessions']['create']>, reason:
 }
 
 describe('SessionTitleService Provider lifecycle', () => {
+  it.each(['fork', 'subagent'] as const)('does not schedule first-prompt generation for an empty %s', async (kind) => {
+    const ctx = new Context()
+    onTestFinished(() => ctx.fiber.dispose())
+    await ctx.plugin(SessionStore)
+    await ctx.plugin(SessionProjectionRegistry)
+    await ctx.plugin(AgentRegistry)
+    await ctx.plugin(SessionTitleService, CONFIG)
+    const generate = vi.fn(async () => ({ title: 'Unexpected', messageSeqs: [] }))
+    ctx.sessionTitle.register({ id: brandString<SessionTitleProviderId>('first'), automatic: 'first-prompt', generate })
+    const source = ctx.sessions.create(brandString<SessionId>('empty-source'))
+    const child = kind === 'fork' ? ctx.sessions.fork(source) : ctx.sessions.create(brandString<SessionId>('child'), {
+      meta: { origin: 'subagent', parentSession: source.id },
+    })
+    expect(child.header.parentSession).toBe(kind === 'fork' ? undefined : source.id)
+    appendHumanPrompt(child, 'First own prompt')
+    appendRoute(child)
+    await settle()
+    expect(generate).not.toHaveBeenCalled()
+  })
+
   it('inherits title events across forks, skips first-prompt retitling, and lets all-messages update later', async () => {
     const ctx = new Context()
     await ctx.plugin(SessionStore)
+    await ctx.plugin(SessionProjectionRegistry)
+    await ctx.plugin(AgentRegistry)
     await ctx.plugin(SessionTitleService, CONFIG)
-    const parent = ctx.sessions.create(SessionId('title-parent'))
+    const parent = ctx.sessions.create(brandString<SessionId>('title-parent'))
     parent.append('turn/start', {
       turn: 1,
     })
@@ -60,17 +87,17 @@ describe('SessionTitleService Provider lifecycle', () => {
     await settle()
     parent.append('turn/end', { turn: 1, reason: { kind: 'completed' } })
 
-    const child = ctx.sessions.fork(parent, undefined, SessionId('title-child'))
+    const child = ctx.sessions.fork(parent, undefined, brandString<SessionId>('title-child'))
     expect(ctx.sessionTitle.get(child)).toEqual(ctx.sessionTitle.get(parent))
-    expect(child.events.find(event => event.type === 'session/title'))
-      .toEqual(parent.events.find(event => event.type === 'session/title'))
+    expect(child.snapshotEvents().find(event => event.type === 'session/title'))
+      .toEqual(parent.snapshotEvents().find(event => event.type === 'session/title'))
 
     const firstGenerate = vi.fn(async (request: SessionTitleProviderRequest) => ({
       title: 'Should not run',
       messageSeqs: [request.messages[0]!.seq],
     }))
     const disposeFirst = ctx.sessionTitle.register({
-      id: SessionTitleProviderId('fork-first'),
+      id: brandString<SessionTitleProviderId>('fork-first'),
       automatic: 'first-prompt',
       generate: firstGenerate,
     })
@@ -90,7 +117,7 @@ describe('SessionTitleService Provider lifecycle', () => {
       messageSeqs: request.messages.map(message => message.seq),
     }))
     ctx.sessionTitle.register({
-      id: SessionTitleProviderId('fork-all'),
+      id: brandString<SessionTitleProviderId>('fork-all'),
       automatic: 'all-prompts',
       generate: allGenerate,
     })
@@ -107,7 +134,7 @@ describe('SessionTitleService Provider lifecycle', () => {
     expect(ctx.sessionTitle.get(child)).toMatchObject({
       title: 'Fork all prompts',
       messageSeqs: [inheritedMessage.seq, childMessage.seq, latestMessage.seq],
-      source: { kind: 'provider', provider: SessionTitleProviderId('fork-all') },
+      source: { kind: 'provider', provider: brandString<SessionTitleProviderId>('fork-all') },
     })
     expect(ctx.sessionTitle.get(parent)?.title).toBe('Inherited title prompt')
   })
@@ -115,10 +142,12 @@ describe('SessionTitleService Provider lifecycle', () => {
   it('runs a first-prompt provider once after the routed request and retries only through refresh', async () => {
     const ctx = new Context()
     await ctx.plugin(SessionStore)
+    await ctx.plugin(SessionProjectionRegistry)
+    await ctx.plugin(AgentRegistry)
     await ctx.plugin(SessionTitleService, CONFIG)
     const requests: SessionTitleProviderRequest[] = []
     const provider: SessionTitleProvider = {
-      id: SessionTitleProviderId('first-model'),
+      id: brandString<SessionTitleProviderId>('first-model'),
       automatic: 'first-prompt',
       async generate(request) {
         requests.push(request)
@@ -130,7 +159,7 @@ describe('SessionTitleService Provider lifecycle', () => {
       },
     }
     ctx.sessionTitle.register(provider)
-    const session = ctx.sessions.create(SessionId('first-provider'))
+    const session = ctx.sessions.create(brandString<SessionId>('first-provider'))
     session.append('turn/start', {
       turn: 1,
     })
@@ -147,12 +176,19 @@ describe('SessionTitleService Provider lifecycle', () => {
       messages: [{ seq: first.seq, text: 'Explain asynchronous title generation' }],
       route: { provider: 'main-route', model: 'chat-model' },
     })
+    // The service captures the fallback it ensured immediately before the
+    // provider call, and that fallback event can follow the source message.
+    expect(requests[0]?.currentTitle).toMatchObject({
+      source: { kind: 'fallback' },
+      messageSeqs: [first.seq],
+    })
+    expect(requests[0]?.currentTitle?.eventSeq).toBeGreaterThan(first.seq)
     expect(ctx.sessionTitle.get(session)).toMatchObject({
       title: 'A model-generated title',
       messageSeqs: [first.seq],
       source: {
         kind: 'provider',
-        provider: SessionTitleProviderId('first-model'),
+        provider: brandString<SessionTitleProviderId>('first-model'),
         model: { provider: 'aux-route', model: 'title-model' },
       },
     })
@@ -167,14 +203,156 @@ describe('SessionTitleService Provider lifecycle', () => {
     expect(requests[1]?.messages.map(message => message.seq)).toEqual([first.seq, second.seq])
   })
 
+  it('omits currentTitle when a one-byte cap makes the fallback underivable from a multibyte message', async () => {
+    const ctx = new Context()
+    onTestFinished(() => ctx.fiber.dispose())
+    await ctx.plugin(SessionStore)
+    await ctx.plugin(SessionProjectionRegistry)
+    await ctx.plugin(AgentRegistry)
+    await ctx.plugin(SessionTitleService, { fallbackMaxWords: 5, fallbackMaxBytes: 1, maxTitleBytes: 24 })
+    const currentTitles: (SessionTitleSnapshot | undefined)[] = []
+    ctx.sessionTitle.register({
+      id: brandString<SessionTitleProviderId>('absent-current'),
+      automatic: 'all-prompts',
+      async generate(request) {
+        currentTitles.push(request.currentTitle)
+        return { title: 'Provided title', messageSeqs: request.messages.map(message => message.seq) }
+      },
+    })
+    const session = ctx.sessions.create(brandString<SessionId>('underivable-fallback'))
+    session.append('turn/start', { turn: 1 })
+    appendHumanPrompt(session, '番')
+    await settle()
+    appendRoute(session)
+    await settle()
+
+    expect(currentTitles).toEqual([undefined])
+    expect(ctx.sessionTitle.get(session)).toMatchObject({
+      title: 'Provided title',
+      source: { kind: 'provider', provider: brandString<SessionTitleProviderId>('absent-current') },
+    })
+  })
+
+  it('passes the latest accepted title snapshot to each provider revision', async () => {
+    const ctx = new Context()
+    onTestFinished(() => ctx.fiber.dispose())
+    await ctx.plugin(SessionStore)
+    await ctx.plugin(SessionProjectionRegistry)
+    await ctx.plugin(AgentRegistry)
+    await ctx.plugin(SessionTitleService, CONFIG)
+    const currentTitles: (SessionTitleSnapshot | undefined)[] = []
+    ctx.sessionTitle.register({
+      id: brandString<SessionTitleProviderId>('current-title'),
+      automatic: 'all-prompts',
+      async generate(request) {
+        currentTitles.push(request.currentTitle)
+        return {
+          title: `Revision ${String(currentTitles.length)}`,
+          messageSeqs: request.messages.map(message => message.seq),
+        }
+      },
+    })
+    const session = ctx.sessions.create(brandString<SessionId>('current-title-snapshot'))
+    session.append('turn/start', { turn: 1 })
+    const first = appendHumanPrompt(session, 'First prompt')
+    await settle()
+    appendRoute(session)
+    await settle()
+
+    expect(currentTitles[0]).toMatchObject({
+      source: { kind: 'fallback' },
+      messageSeqs: [first.seq],
+    })
+
+    appendHumanPrompt(session, 'Second prompt')
+    appendRoute(session, 'change')
+    await settle()
+
+    expect(currentTitles[1]).toMatchObject({
+      title: 'Revision 1',
+      messageSeqs: [first.seq],
+      source: { kind: 'provider', provider: brandString<SessionTitleProviderId>('current-title') },
+    })
+    expect(Object.isFrozen(currentTitles[1])).toBe(true)
+  })
+
+  it('preserves provider input order across bounded title-input chunks', async () => {
+    const ctx = new Context()
+    await ctx.plugin(SessionStore)
+    await ctx.plugin(SessionProjectionRegistry)
+    await ctx.plugin(AgentRegistry)
+    await ctx.plugin(SessionTitleService, CONFIG)
+    const session = ctx.sessions.create(brandString<SessionId>('chunked-provider-input'))
+    session.append('turn/start', { turn: 1 })
+    const messages = Array.from({ length: 70 }, (_, index) =>
+      appendHumanPrompt(session, `Prompt ${String(index)}`))
+    await settle()
+    const generate = vi.fn(async (request: SessionTitleProviderRequest): Promise<SessionTitleProviderResult> => ({
+      title: 'Chunked history',
+      messageSeqs: request.messages.map(message => message.seq),
+    }))
+    ctx.sessionTitle.register({
+      id: brandString<SessionTitleProviderId>('chunked-provider'),
+      automatic: 'all-prompts',
+      generate,
+    })
+
+    await ctx.sessionTitle.refresh(session)
+
+    expect(generate).toHaveBeenCalledOnce()
+    expect(generate.mock.calls[0]?.[0].messages).toEqual(messages.map((message, index) => ({
+      seq: message.seq,
+      text: `Prompt ${String(index)}`,
+    })))
+  })
+
+  it('cuts a first-message provider request at its scheduled watermark when a newer prompt lands first', async () => {
+    const ctx = new Context()
+    await ctx.plugin(SessionStore)
+    await ctx.plugin(SessionProjectionRegistry)
+    await ctx.plugin(AgentRegistry)
+    await ctx.plugin(SessionTitleService, CONFIG)
+    const requests: SessionTitleProviderRequest[] = []
+    ctx.sessionTitle.register({
+      id: brandString<SessionTitleProviderId>('watermark-cut'),
+      automatic: 'first-prompt',
+      async generate(request) {
+        requests.push(request)
+        return {
+          title: 'Watermarked title',
+          messageSeqs: request.messages.map(message => message.seq),
+        }
+      },
+    })
+    const session = ctx.sessions.create(brandString<SessionId>('watermark-cut'))
+    session.append('turn/start', {
+      turn: 1,
+    })
+    const first = appendHumanPrompt(session, 'First prompt')
+    await settle()
+    appendHumanPrompt(session, 'A newer prompt before the route')
+    appendRoute(session)
+    await settle()
+
+    expect(requests).toHaveLength(1)
+    expect(requests[0]?.messages).toEqual([{ seq: first.seq, text: 'First prompt' }])
+    expect(ctx.sessionTitle.get(session)).toMatchObject({
+      title: 'Watermarked title',
+      messageSeqs: [first.seq],
+      source: { kind: 'provider', provider: brandString<SessionTitleProviderId>('watermark-cut') },
+    })
+  })
+
   it('rejects a second provider and drains stale work when the winner is disposed', async () => {
     const ctx = new Context()
     await ctx.plugin(SessionStore)
+    await ctx.plugin(SessionProjectionRegistry)
+    await ctx.plugin(AgentRegistry)
     await ctx.plugin(SessionTitleService, CONFIG)
     const pending = deferred<SessionTitleProviderResult>()
     let observedSignal: AbortSignal | undefined
     const first: SessionTitleProvider = {
-      id: SessionTitleProviderId('winner'),
+      id: brandString<SessionTitleProviderId>('winner'),
       automatic: 'all-prompts',
       generate(request) {
         observedSignal = request.signal
@@ -183,12 +361,12 @@ describe('SessionTitleService Provider lifecycle', () => {
     }
     const dispose = ctx.sessionTitle.register(first)
     expect(() => ctx.sessionTitle.register({
-      id: SessionTitleProviderId('duplicate'),
+      id: brandString<SessionTitleProviderId>('duplicate'),
       automatic: 'first-prompt',
-      generate: async () => ({ title: 'duplicate', messageSeqs: [0] }),
+      generate: async () => ({ title: 'duplicate', messageSeqs: [SessionSeq(0)] }),
     })).toThrow(/already registered/)
 
-    const session = ctx.sessions.create(SessionId('dispose-provider'))
+    const session = ctx.sessions.create(brandString<SessionId>('dispose-provider'))
     session.append('turn/start', {
       turn: 1,
     })
@@ -210,7 +388,7 @@ describe('SessionTitleService Provider lifecycle', () => {
     expect(ctx.sessionTitle.get(session)?.source.kind).toBe('fallback')
 
     const replacement: SessionTitleProvider = {
-      id: SessionTitleProviderId('replacement'),
+      id: brandString<SessionTitleProviderId>('replacement'),
       automatic: 'first-prompt',
       generate: async () => ({ title: 'replacement', messageSeqs: [message.seq] }),
     }
@@ -218,14 +396,52 @@ describe('SessionTitleService Provider lifecycle', () => {
     await disposeReplacement()
   })
 
+  it('accepts a replacement while the previous provider drains and discards its late result', async () => {
+    const ctx = new Context()
+    await ctx.plugin(SessionStore)
+    await ctx.plugin(SessionProjectionRegistry)
+    await ctx.plugin(AgentRegistry)
+    await ctx.plugin(SessionTitleService, CONFIG)
+    const pending = deferred<SessionTitleProviderResult>()
+    const dispose = ctx.sessionTitle.register({
+      id: brandString<SessionTitleProviderId>('retiring'),
+      automatic: 'all-prompts',
+      generate: () => pending.promise,
+    })
+    const session = ctx.sessions.create(brandString<SessionId>('replace-while-draining'))
+    session.append('turn/start', { turn: 1 })
+    const message = appendHumanPrompt(session, 'Generate this title')
+    await settle()
+    appendRoute(session)
+    await settle()
+
+    const disposal = dispose()
+    const disposeReplacement = ctx.sessionTitle.register({
+      id: brandString<SessionTitleProviderId>('replacement'),
+      automatic: 'all-prompts',
+      generate: async () => ({ title: 'replacement', messageSeqs: [message.seq] }),
+    })
+    expect(() => ctx.sessionTitle.register({
+      id: brandString<SessionTitleProviderId>('duplicate'),
+      automatic: 'first-prompt',
+      generate: async () => ({ title: 'duplicate', messageSeqs: [message.seq] }),
+    })).toThrow(/"replacement" is already registered/)
+    pending.resolve({ title: 'stale provider result', messageSeqs: [message.seq] })
+    await disposal
+    expect(ctx.sessionTitle.get(session)?.title).not.toBe('stale provider result')
+    await disposeReplacement()
+  })
+
   it('supersedes an older all-messages revision and cannot commit an ignored abort', async () => {
     const ctx = new Context()
     await ctx.plugin(SessionStore)
+    await ctx.plugin(SessionProjectionRegistry)
+    await ctx.plugin(AgentRegistry)
     await ctx.plugin(SessionTitleService, CONFIG)
     const firstResult = deferred<SessionTitleProviderResult>()
     const requests: SessionTitleProviderRequest[] = []
     const provider: SessionTitleProvider = {
-      id: SessionTitleProviderId('all-model'),
+      id: brandString<SessionTitleProviderId>('all-model'),
       automatic: 'all-prompts',
       generate(request) {
         requests.push(request)
@@ -237,7 +453,7 @@ describe('SessionTitleService Provider lifecycle', () => {
       },
     }
     ctx.sessionTitle.register(provider)
-    const session = ctx.sessions.create(SessionId('supersede'))
+    const session = ctx.sessions.create(brandString<SessionId>('supersede'))
     session.append('turn/start', {
       turn: 1,
     })
@@ -262,12 +478,15 @@ describe('SessionTitleService Provider lifecycle', () => {
 
   it('runs an all-messages revision when the next main request reuses its logged header', async () => {
     const ctx = new Context()
+    onTestFinished(() => ctx.fiber.dispose())
     await ctx.plugin(LlmRuntime)
     await ctx.plugin(SessionStore)
+    await ctx.plugin(SessionProjectionRegistry)
+    await ctx.plugin(AgentRegistry)
     await ctx.plugin(SessionTitleService, CONFIG)
     const requests: SessionTitleProviderRequest[] = []
     ctx.sessionTitle.register({
-      id: SessionTitleProviderId('unchanged-route'),
+      id: brandString<SessionTitleProviderId>('unchanged-route'),
       automatic: 'all-prompts',
       async generate(request) {
         requests.push(request)
@@ -277,13 +496,13 @@ describe('SessionTitleService Provider lifecycle', () => {
         }
       },
     })
-    const session = ctx.sessions.create(SessionId('unchanged-route'))
+    const session = ctx.sessions.create(brandString<SessionId>('unchanged-route'))
     session.append('turn/start', {
       turn: 1,
     })
+    session.append('step/start', { turn: 1, step: 1 })
     const first = appendHumanPrompt(session, 'First routed prompt')
     await settle()
-    session.append('step/start', { turn: 1, step: 1 })
     appendRoute(session)
     await settle()
     session.append('step/end', { turn: 1, step: 1 })
@@ -292,9 +511,9 @@ describe('SessionTitleService Provider lifecycle', () => {
     session.append('turn/start', {
       turn: 2,
     })
+    session.append('step/start', { turn: 2, step: 1 })
     const second = appendHumanPrompt(session, 'Second prompt on the same route')
     await settle()
-    session.append('step/start', { turn: 2, step: 1 })
     void ctx.llm.stream(markAgentLoopRequest(deepFreeze({
       provider: 'main-route',
       model: 'chat-model',
@@ -303,7 +522,7 @@ describe('SessionTitleService Provider lifecycle', () => {
     })))
     await settle()
 
-    expect(session.events.filter(event => event.type === 'request/header')).toHaveLength(1)
+    expect(session.snapshotEvents().filter(event => event.type === 'request/header')).toHaveLength(1)
     expect(requests).toHaveLength(2)
     expect(requests[1]).toMatchObject({
       messages: [
@@ -318,23 +537,25 @@ describe('SessionTitleService Provider lifecycle', () => {
     const ctx = new Context()
     await ctx.plugin(LlmRuntime)
     await ctx.plugin(SessionStore)
+    await ctx.plugin(SessionProjectionRegistry)
+    await ctx.plugin(AgentRegistry)
     await ctx.plugin(SessionTitleService, CONFIG)
     const generate = vi.fn(async (request: SessionTitleProviderRequest): Promise<SessionTitleProviderResult> => ({
       title: 'Unexpected title',
       messageSeqs: request.messages.map(message => message.seq),
     }))
     ctx.sessionTitle.register({
-      id: SessionTitleProviderId('request-filter'),
+      id: brandString<SessionTitleProviderId>('request-filter'),
       automatic: 'all-prompts',
       generate,
     })
     const options = { provider: 'main-route', model: 'chat-model', messages: [] }
 
     void ctx.llm.stream(deepFreeze(options))
-    void ctx.llm.stream(markAgentLoopRequest(deepFreeze({ ...options, sessionId: SessionId('missing') })))
-    const quiet = ctx.sessions.create(SessionId('quiet'))
+    void ctx.llm.stream(markAgentLoopRequest(deepFreeze({ ...options, sessionId: brandString<SessionId>('missing') })))
+    const quiet = ctx.sessions.create(brandString<SessionId>('quiet'))
     void ctx.llm.stream(markAgentLoopRequest(deepFreeze({ ...options, sessionId: quiet.id })))
-    const pending = ctx.sessions.create(SessionId('unmatched-boundary'))
+    const pending = ctx.sessions.create(brandString<SessionId>('unmatched-boundary'))
     pending.append('turn/start', {
       turn: 1,
     })
@@ -349,15 +570,17 @@ describe('SessionTitleService Provider lifecycle', () => {
   it('contains automatic failures but lets explicit refresh reject', async () => {
     const ctx = new Context()
     await ctx.plugin(SessionStore)
+    await ctx.plugin(SessionProjectionRegistry)
+    await ctx.plugin(AgentRegistry)
     await ctx.plugin(SessionTitleService, CONFIG)
     const warn = vi.spyOn(ctx.logger, 'warn').mockImplementation(() => undefined)
     const provider: SessionTitleProvider = {
-      id: SessionTitleProviderId('failing'),
+      id: brandString<SessionTitleProviderId>('failing'),
       automatic: 'all-prompts',
       generate: async () => { throw new Error('title backend failed') },
     }
     ctx.sessionTitle.register(provider)
-    const session = ctx.sessions.create(SessionId('failure'))
+    const session = ctx.sessions.create(brandString<SessionId>('failure'))
     session.append('turn/start', {
       turn: 1,
     })

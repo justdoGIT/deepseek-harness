@@ -9,6 +9,9 @@
   ],
   "references": [
     {
+      "path": "../../util/brand"
+    },
+    {
       "path": "../../../vendor/cosmokit"
     },
     {
@@ -24,10 +27,22 @@
       "path": "../../core/agent"
     },
     {
-      "path": "../../interaction/user-approval"
+      "path": "../../attachment/attachment"
     },
     {
-      "path": "../../runtime-diagnostics/invariants"
+      "path": "../../llm/llm"
+    },
+    {
+      "path": "../../llm/token-meter"
+    },
+    {
+      "path": "../../mcp/mcp-client"
+    },
+    {
+      "path": "../../session/session-persistence"
+    },
+    {
+      "path": "../../interaction/user-approval"
     }
   ]
 }

@@ -7,17 +7,26 @@
  * shared overlay whose row exists only on another surface.
  */
 
-import { mkdtempSync, writeFileSync } from 'node:fs'
+import { mkdtempSync, rmSync, writeFileSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
-import { describe, expect, it, vi } from 'vitest'
-import * as yaml from 'js-yaml'
-import { entryListSchema } from '@deepseek-ai/cordis-plugin-include'
+import { pathToFileURL } from 'node:url'
+import { afterAll, describe, expect, it, vi } from 'vitest'
+import { parseEntryYaml } from '@deepseek-ai/cordis-plugin-include'
 import { loadOverlayPatches, renderConfigDump } from '../src/index.ts'
 
 const NAME = 'dsh-test-bin'
 
-const tmp = (): string => mkdtempSync(join(tmpdir(), 'dsh-config-dump-'))
+const tempRoots: string[] = []
+afterAll(() => {
+  for (const root of tempRoots.splice(0)) rmSync(root, { recursive: true, force: true })
+})
+
+const tmp = (): string => {
+  const dir = mkdtempSync(join(tmpdir(), 'dsh-config-dump-'))
+  tempRoots.push(dir)
+  return dir
+}
 
 function writeBase(dir: string): string {
   const base = join(dir, 'base.yml')
@@ -63,7 +72,7 @@ describe('renderConfigDump', () => {
     ], () => {})
     // Comments do not break loadability: the dump parses as one document
     // equal to what boot() would mount.
-    const parsed = yaml.load(dump, { schema: entryListSchema }) as {
+    const parsed = parseEntryYaml(dump) as {
       id: string
       config?: Record<string, unknown>
     }[]
@@ -74,7 +83,11 @@ describe('renderConfigDump', () => {
         config: { value: 'surface', key: { __jsExpr: 'process.env.DSH_DUMP_SPEC' } },
       },
       { id: 'untouched', name: './noop.mjs' },
-      { id: 'surface-extra', name: './noop.mjs', config: { value: 'user' } },
+      {
+        id: 'surface-extra',
+        name: pathToFileURL(join(dir, 'noop.mjs')).href,
+        config: { value: 'user' },
+      },
     ])
     // Unevaluated: the expression text round-trips as a !!js scalar.
     expect(dump).toContain('!!js process.env.DSH_DUMP_SPEC')
@@ -126,7 +139,7 @@ describe('renderConfigDump', () => {
       { label: 'b.yml', patches: [{ id: 'child', config: { v: 2 } }] },
     ], line => void warnings.push(line))
     expect(warnings).toEqual([`${NAME}: [b.yml] patch: entry "child" not found`])
-    const parsed = yaml.load(dump, { schema: entryListSchema }) as {
+    const parsed = parseEntryYaml(dump) as {
       config?: { config?: { v?: number } }[]
     }[]
     expect(parsed[0]?.config?.[0]?.config?.v).toBe(1)
@@ -155,7 +168,7 @@ describe('renderConfigDump', () => {
       line => void warnings.push(line),
     )
     expect(warnings).toEqual([`${NAME}: [overlay.yml] patch: entry "only-on-another-surface" not found`])
-    const parsed = yaml.load(dump, { schema: entryListSchema }) as { config?: { value?: string } }[]
+    const parsed = parseEntryYaml(dump) as { config?: { value?: string } }[]
     expect(parsed[0]?.config?.value).toBe('patched')
   })
 

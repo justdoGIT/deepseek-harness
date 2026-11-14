@@ -1,6 +1,6 @@
 /**
- * SDK-facing JSON-RPC plugin over stdio. An external `cordis.yml` decides
- * whether to load it; see the single-executable Agent Note and package README.
+ * SDK-facing JSON-RPC plugin over stdio. The selected dsh profile decides
+ * whether to load it; see the single-launch Agent Note and package README.
  * Stdout is reserved for protocol frames, so the tree must not load a stdout logger.
  * This plugin answers `shutdown`, disposes the complete root runtime, and exits 0; the app bin
  * owns EOF and signal exits. Keep named plugin exports with no default export so
@@ -9,7 +9,7 @@
  * @module @deepseek-ai/dsh-sdk-jsonrpc-server
  */
 
-import type { Context } from '@deepseek-ai/cordis'
+import { Context } from '@deepseek-ai/cordis'
 import type { Readable, Writable } from 'node:stream'
 import Schema from '@deepseek-ai/schemastery'
 import { JsonRpcLineTransport } from '@deepseek-ai/dsh-sdk-protocol'
@@ -18,8 +18,7 @@ import { HarnessSdkJsonRpcServer } from './server.ts'
 export * from './server.ts'
 
 export const name = 'sdk-jsonrpc-server'
-// Only the agent factory is required; initialize reads the optional LLM seam with ctx.get().
-export const inject = ['agents']
+export const inject = ['agents', 'workingDirectory']
 
 /** JSON-RPC deployment config plus runtime-only test hooks. */
 export interface JsonRpcConfig {
@@ -48,7 +47,7 @@ export function apply(ctx: Context, config: JsonRpcConfig): void {
   const resolvedConfig = config as JsonRpcConfig & { maxTokensAsSuccess: boolean }
   // Protocol shutdown owns the complete runtime process, so it must await the
   // root lifecycle (including persistence) before exiting.
-  const rootFiber = ctx.root.fiber
+  const rootFiber = ctx[Context.root].fiber
   /* v8 ignore next -- production stdio wiring; tests always inject the runtime hooks */
   const input = config.input ?? process.stdin
   /* v8 ignore next -- production stdio wiring; tests always inject the runtime hooks */
@@ -60,6 +59,9 @@ export function apply(ctx: Context, config: JsonRpcConfig): void {
   const server = new HarnessSdkJsonRpcServer(ctx, transport, {
     maxTokensAsSuccess: resolvedConfig.maxTokensAsSuccess,
   })
+  // Compositions can order Schedule after its activation handler is installed.
+  // Like the app startup marker, this carries readiness, not another control API.
+  ctx.provide('sdkSessionActivation', { ready: true })
 
   // Share one exit task so racing shutdown requests cannot dispose the root or
   // exit the process more than once.
@@ -77,9 +79,13 @@ export function apply(ctx: Context, config: JsonRpcConfig): void {
     // `initialize` is the SDK's readiness boundary. This plugin can activate
     // before async sibling Loader entries (for example an MCP client's initial
     // tool discovery), so do not advertise a ready runtime until the complete
-    // current tree has settled. A hand-built context without Loader remains
+    // current tree has settled. Loader settlement joins entry imports, fiber
+    // lifecycle work, and synchronous effect registration; no scheduler delay
+    // is part of readiness. A hand-built context without Loader remains
     // immediately usable.
-    if (method === 'initialize') await ctx.get('loader')?.await()
+    if (method === 'initialize') {
+      await ctx.get('loader')?.await()
+    }
     const result = await server.handleRequest(method, params)
     if (method === 'shutdown') {
       // Run after the handler result is written; the task then flushes, disposes, and exits.
