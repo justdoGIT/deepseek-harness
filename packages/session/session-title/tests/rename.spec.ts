@@ -4,9 +4,12 @@
 import { Context } from '@deepseek-ai/cordis'
 import { describe, expect, it, vi } from 'vitest'
 import { createUserMessage } from '@deepseek-ai/dsh-llm'
-import SessionStore, { Session, SessionId } from '@deepseek-ai/dsh-session'
+import SessionStore, { Session, type SessionId } from '@deepseek-ai/dsh-session'
+import AgentRegistry from '@deepseek-ai/dsh-agent'
+import SessionProjectionRegistry from '@deepseek-ai/dsh-session-projection'
+import { brandString } from '@deepseek-ai/dsh-brand'
+import type { SessionTitleProviderId } from '@deepseek-ai/dsh-session-title/types'
 import SessionTitleService, {
-  SessionTitleProviderId,
   foldSessionTitle,
   type SessionTitleProviderRequest,
 } from '@deepseek-ai/dsh-session-title'
@@ -32,8 +35,10 @@ describe('SessionTitleService.rename', () => {
   it('appends a normalized user-source title', async () => {
     const ctx = new Context()
     await ctx.plugin(SessionStore)
+    await ctx.plugin(SessionProjectionRegistry)
+    await ctx.plugin(AgentRegistry)
     await ctx.plugin(SessionTitleService, CONFIG)
-    const session = ctx.sessions.create(SessionId('rename-accept'))
+    const session = ctx.sessions.create(brandString<SessionId>('rename-accept'))
     session.append('turn/start', { turn: 1 })
     appendHumanPrompt(session, 'Original prompt text')
     await settle()
@@ -44,41 +49,45 @@ describe('SessionTitleService.rename', () => {
       messageSeqs: [],
       source: { kind: 'user' },
     })
-    const event = session.events.findLast(item => item.type === 'session/title')
+    const event = session.snapshotEvents().findLast(item => item.type === 'session/title')
     expect(event?.data).toEqual({
       title: 'Hand picked name',
       messageSeqs: [],
       source: { kind: 'user' },
     })
     // foldSessionTitle round-trips the third source kind.
-    expect(foldSessionTitle(session.events)?.source).toEqual({ kind: 'user' })
+    expect(foldSessionTitle(session.snapshotEvents())?.source).toEqual({ kind: 'user' })
   })
 
   it('rejects titles that normalize to empty and dead sessions', async () => {
     const ctx = new Context()
     await ctx.plugin(SessionStore)
+    await ctx.plugin(SessionProjectionRegistry)
+    await ctx.plugin(AgentRegistry)
     await ctx.plugin(SessionTitleService, CONFIG)
-    const session = ctx.sessions.create(SessionId('rename-reject'))
+    const session = ctx.sessions.create(brandString<SessionId>('rename-reject'))
     expect(() => ctx.sessionTitle.rename(session, '  [31m  ')).toThrow(/visible characters/)
 
-    expect(() => ctx.sessionTitle.rename(Session.create(SessionId('detached')), 'name'))
+    expect(() => ctx.sessionTitle.rename(Session.create(brandString<SessionId>('detached')), 'name'))
       .toThrow(/not live in this store/)
   })
 
   it('pins the title: later user messages schedule no automatic revision; refresh unpins', async () => {
     const ctx = new Context()
     await ctx.plugin(SessionStore)
+    await ctx.plugin(SessionProjectionRegistry)
+    await ctx.plugin(AgentRegistry)
     await ctx.plugin(SessionTitleService, CONFIG)
     const generate = vi.fn(async (request: SessionTitleProviderRequest) => ({
       title: 'Provider title',
       messageSeqs: request.messages.map(message => message.seq),
     }))
     ctx.sessionTitle.register({
-      id: SessionTitleProviderId('pin-provider'),
+      id: brandString<SessionTitleProviderId>('pin-provider'),
       automatic: 'all-prompts',
       generate,
     })
-    const session = ctx.sessions.create(SessionId('rename-pin'))
+    const session = ctx.sessions.create(brandString<SessionId>('rename-pin'))
     session.append('turn/start', { turn: 1 })
     appendHumanPrompt(session, 'First prompt')
     await settle()
@@ -105,8 +114,10 @@ describe('SessionTitleService.rename', () => {
   it('fallback-only refresh also unpins: the user title yields to a re-derived fallback', async () => {
     const ctx = new Context()
     await ctx.plugin(SessionStore)
+    await ctx.plugin(SessionProjectionRegistry)
+    await ctx.plugin(AgentRegistry)
     await ctx.plugin(SessionTitleService, CONFIG)
-    const session = ctx.sessions.create(SessionId('rename-unpin-fallback'))
+    const session = ctx.sessions.create(brandString<SessionId>('rename-unpin-fallback'))
     session.append('turn/start', { turn: 1 })
     appendHumanPrompt(session, 'Derivable prompt words')
     await settle()
@@ -126,6 +137,8 @@ describe('SessionTitleService.rename', () => {
   it('supersedes in-flight automatic generation: a late provider result cannot override the user title', async () => {
     const ctx = new Context()
     await ctx.plugin(SessionStore)
+    await ctx.plugin(SessionProjectionRegistry)
+    await ctx.plugin(AgentRegistry)
     await ctx.plugin(SessionTitleService, CONFIG)
     // The provider parks on a test-held deferred so rename lands while its
     // generation is ACTIVE (not merely scheduled).
@@ -138,11 +151,11 @@ describe('SessionTitleService.rename', () => {
       return { title: 'Late provider title', messageSeqs: request.messages.map(message => message.seq) }
     })
     ctx.sessionTitle.register({
-      id: SessionTitleProviderId('deferred-provider'),
+      id: brandString<SessionTitleProviderId>('deferred-provider'),
       automatic: 'all-prompts',
       generate,
     })
-    const session = ctx.sessions.create(SessionId('rename-supersede'))
+    const session = ctx.sessions.create(brandString<SessionId>('rename-supersede'))
     session.append('turn/start', { turn: 1 })
     appendHumanPrompt(session, 'Prompt that triggers generation')
     session.append('request/header', {
@@ -158,17 +171,19 @@ describe('SessionTitleService.rename', () => {
     await settle()
     // The released provider result must not append over the user title, and
     // the swallowed abort must not surface as an unhandled rejection.
-    const latest = session.events.findLast(item => item.type === 'session/title')
+    const latest = session.snapshotEvents().findLast(item => item.type === 'session/title')
     expect(latest?.data).toMatchObject({ title: 'User wins', source: { kind: 'user' } })
   })
 
   it('fallback-only refresh keeps the user title when no fallback is derivable', async () => {
     const ctx = new Context()
     await ctx.plugin(SessionStore)
+    await ctx.plugin(SessionProjectionRegistry)
+    await ctx.plugin(AgentRegistry)
     // A 3-byte fallback cap cannot hold the 4-byte emoji prompt: the
     // re-derived fallback is empty, so the pinned title survives the refresh.
     await ctx.plugin(SessionTitleService, { ...CONFIG, fallbackMaxBytes: 3 })
-    const session = ctx.sessions.create(SessionId('rename-unpin-empty'))
+    const session = ctx.sessions.create(brandString<SessionId>('rename-unpin-empty'))
     session.append('turn/start', { turn: 1 })
     appendHumanPrompt(session, '😀😀')
     await settle()
